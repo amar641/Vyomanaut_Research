@@ -23,7 +23,7 @@ audit_receipts (
   chunk_id                BYTEA(32)    NOT NULL,  -- SHA256 of chunk content (content address)
   file_id                 UUID         NOT NULL,  -- pseudonymous file handle (not plaintext CID)
   provider_id             UUID         NOT NULL,  -- FK → providers, soft delete only
-  challenge_nonce         BYTEA(32)    NOT NULL,  -- HMAC(server_secret, chunk_id + server_ts)
+  challenge_nonce         BYTEA(33)    NOT NULL,  -- HMAC(server_secret, chunk_id + server_ts)
   server_challenge_ts     TIMESTAMPTZ  NOT NULL,  -- set by server, not provider
   response_hash           BYTEA(32)    NOT NULL,  -- SHA256(chunk_data || challenge_nonce)
   response_latency_ms     INT          NOT NULL,  -- JIT detector: time between challenge sent and response received

@@ -64,6 +64,8 @@ Protocol:
    service_countersign_ts = NOW().
 4. The countersignature is returned to the provider.
 
+<!-- > **Note:** According to [ADR-017](./ADR-017-audit-receipt-schema.md) the Postgres row security policy prohibits row Updates. Here audit_result column specifically is treated as an exception allowing UPDATE and no DELETE ever -->
+
 If the microservice crashes after step 1 but before step 4:
 - The provider receives no countersignature.
 - On the next audit cycle (24 hours), the provider receives a new challenge.
@@ -71,6 +73,7 @@ If the microservice crashes after step 1 but before step 4:
   ignores NULL rows (they are treated as in-flight, not as FAIL).
 - After 48 hours, any row with audit_result = NULL is garbage-collected: marked as
   ABANDONED and not counted in any score window.
+
 
 If the provider re-submits the same challenge response before the next audit cycle
 (provider-side retry logic):

@@ -910,7 +910,7 @@ Data owner client                    Provider (×16 of 56)
       │   AEAD_CHACHA20_POLY1305 decrypt)   │
       │─ Read provider list + chunk IDs     │
       │                                     │
-      │─ QUIC dial to 16 fastest providers ─────────────────────────►│
+      │─ QUIC dial to any of the 16 available providers ─────────────────────────►│
       │─ Request chunk by chunk_id ─────────────────────────────────►│
       │◄─ 256KB fragment ────────────────────────────────────────────│ (×16)
       │                                     │
@@ -1002,7 +1002,7 @@ If the availability service fails to republish a provider's DHT record within th
 
 **Postgres.** Managed Postgres with Multi-AZ replication enabled (e.g. AWS RDS `db.t3.medium`: **2 vCPU, 4 GB RAM**, 100 GB GP3 SSD to start, auto-scaling enabled). The microservice writes to the primary; read-heavy paths (score queries, assignment lookups) use a read replica. Monthly partition archival of `audit_receipts` is mandatory — partitions older than 30 days move to object storage (S3 / GCS).
 
-**Relay nodes.** Three instances (**1 vCPU, 1 GB RAM, minimum 1 Gbps network**), one per availability zone. At launch: Delhi AZ, Mumbai AZ1, Mumbai AZ2 (or Chennai as third). Each runs libp2p with Circuit Relay v2 enabled, sized for 128 concurrent relay reservations — 384 total slots, 4.3× headroom at 300 initial providers. Scale to a fourth node when provider count exceeds 570 (the relay saturation point at 45% CGNAT fraction).
+**Relay nodes.** Three instances (**1 vCPU, 1 GB RAM, minimum 1 Gbps network**), one per availability zone. At launch: Mumbai AZ1, Mumbai AZ2, Chennai/Hyderabad. Each runs libp2p with Circuit Relay v2 enabled, sized for 128 concurrent relay reservations — 384 total slots, 4.3× headroom at 300 initial providers. Scale to a fourth node when provider count exceeds 570 (the relay saturation point at 45% CGNAT fraction).
 
 **Provider daemon.** Runs on provider hardware — home desktop or NAS. Cross-platform binary for Windows 10+, macOS 12+, and Ubuntu 22.04+. No cloud dependency. Connects outbound to the microservice via HTTPS and to other providers via libp2p.
 
