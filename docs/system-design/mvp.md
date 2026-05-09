@@ -10,17 +10,22 @@
 | **Classification** | Internal Engineering |
 | **Date** | April 2026 |
 | **Author** | Vyomanaut Engineering |
-| **Approved by** | — (pending) |
 | **Repository** | [masamasaowl/Vyomanaut_Research](https://github.com/masamasaowl/Vyomanaut_Research) |
 
-**Companion documents** (authoritative where this document conflicts):
+**Companion documents:** 
+>**Note:** The below documents are always authoritatve on every decision road block and inconsistecies discovered during build. This file is purely for reference and major decisions must always be rechecked throughly from the listed documentes.
 
 | Document | Path | Relationship |
 |---|---|---|
 | System Architecture | `docs/system-design/architecture.md` | Describes the finished system; this document describes how to build it |
 | Product Requirements | `docs/system-design/requirements.md` | Defines what must be built; this document defines in what order |
+| OpenAPI specification | `docs/api/openapi.yaml` | Contract for the Vyomanaut coordination microservice. It is the single source of truth for frontend, mobile, daemon, and backend teams |
+| Canonical Data Model | `docs/system-design/data-model.md` |  The ERD of our project; refer before every schema action |
+| Interface Contracts| `docs/system-design/interface-contracts.md` | All the internal contracts defining the function signatures and type definitions |
+| Sequence Diagrams | `docs/system-design/sequence-diagrams` | Contains the 6 critical design flows in mermaid with multiple paths |
 | Accepted Trade-offs | `docs/system-design/trade-offs.md` | Explains what was chosen and why; this document assumes all trade-offs are settled |
 | Capacity Estimation | `docs/system-design/capacity.md` | Quantifies scaling limits; this document references them per milestone |
+| Repository structure | `docs/system-design/repo-structure.md` | Compiles all the repository maps of the project |
 | ADR Index | `docs/decisions/README.md` | One file per architectural decision; milestones reference specific ADRs |
 | Open Questions | `docs/research/open-questions.md` | Questions whose answers affect implementation; resolved per milestone |
 | Benchmarking Protocol | `docs/research/benchmarking-protocol.md` | Defines how to run the benchmarks required by M1 and M2 |
@@ -58,14 +63,13 @@ Every milestone exists to bring one or more of these paths to correctness. Nothi
 - At the 56-provider floor, only 1 file segment can upload at a time (all 56 slots occupied)
 - Repair window exceeds 12 hours below 500 providers — manual oversight required at launch scale
 - Relay infrastructure is the first scaling bottleneck, binding at ~570-850 providers
-- Per-provider storage must not exceed ~70 GB at MTTF=180d to stay within bandwidth budget
-- Postgres audit INSERT rate is the architectural ceiling at ~100,000 providers x 10,000 chunks
+- Per-provider storage must not exceed ~70 GB at MTTF=180d to stay within bandwidth budget (Note: Ceiling at MTTF=300d is ~130 GB)
+- Postgres audit INSERT rate is the architectural ceiling at ~100,000 providers x 10,000 chunks or 5,000 providers × 200,000 chunks
 
 ---
 
 ## Table of Contents
 
-- [Terminology and Glossary](#terminology-and-glossary)
 - [Architecture Context](#architecture-context)
 - [Critical Path Analysis](#critical-path-analysis)
 - [Milestone Dependency Graph](#milestone-dependency-graph)
@@ -92,43 +96,6 @@ Every milestone exists to bring one or more of these paths to correctness. Nothi
 - [Appendix B — ADR Reference Index](#appendix-b--adr-reference-index)
 - [Appendix C — Research Paper Index](#appendix-c--research-paper-index)
 - [Appendix D — Capacity Quick-Reference](#appendix-d--capacity-quick-reference)
-
----
-
-## Terminology and Glossary
-
-| Term | Definition |
-|---|---|
-| **AONT** | All-or-Nothing Transform. An encryption scheme where the key K is embedded in the ciphertext and can only be recovered by assembling all codewords. Used before erasure coding so that possessing fewer than k=16 fragments reveals nothing. |
-| **ASN** | Autonomous System Number. Identifies an ISP or network operator. The 20% ASN cap ensures no correlated provider group holds more than ~11 of 56 fragments of any file. |
-| **BWavg** | Steady-state repair bandwidth per provider (Kbps). Computed via Giroire Formula 1. Target: <= 100 Kbps. At MTTF=300d, ~39 Kbps. |
-| **Canary** | A fixed 16-byte value appended to plaintext before AONT encoding. Verified on decode to detect corruption. If the canary fails, the segment is corrupt. |
-| **Chunk** | A 256 KB encrypted fragment. The atomic unit of storage, audit, and repair. Each file segment produces 56 chunks. |
-| **Circuit Relay v2** | A libp2p protocol for routing traffic through an intermediary when direct connections are impossible (symmetric NAT). |
-| **DCUtR** | Direct Connection Upgrade through Relay. A libp2p NAT hole-punching protocol with 97.6% first-attempt success rate for cone NAT. |
-| **DHT** | Distributed Hash Table. Specifically, Kademlia. Used for chunk-address lookup on the data plane. Provider discovery goes through the microservice, not the DHT. |
-| **Ed25519** | A digital signature scheme. Used for audit receipts (both provider and microservice sign), pointer file integrity, and peer identity. |
-| **Escrow** | Funds held by the system on behalf of providers. Balance is computed, never stored: `SUM(DEPOSIT) - SUM(RELEASE + SEIZURE)`. Integer paise only. |
-| **Giroire Formula** | A family of analytical formulas for computing data loss rate, repair bandwidth, and burst transfer volume in lazy-repair erasure-coded systems. From Paper 10. |
-| **HKDF** | HMAC-based Key Derivation Function (SHA-256). Derives file keys, pointer keys, and keystore keys from the master secret. |
-| **JIT flag** | Just-In-Time retrieval detection. Set when a provider responds faster than `0.3x` the expected transfer time, suggesting they did not read from local disk. |
-| **K (AONT key)** | A fresh 256-bit random key generated per segment. Embedded in the erasure-coded data via `c_{s+1} = K XOR SHA-256(all codewords)`. Never stored or transmitted separately. |
-| **lf** | Fragment (chunk) size. Fixed at 256 KB (262,144 bytes) in V2. |
-| **Master secret** | `Argon2id(passphrase, owner_id)`. The root of the data owner's key hierarchy. Never written to disk or transmitted. |
-| **MTTF** | Mean Time To Failure. For V2 desktop providers: target 300 days, minimum acceptable 180 days. |
-| **Pointer file** | A per-file metadata structure containing provider IDs, chunk content addresses, and erasure parameters. Encrypted with AEAD_CHACHA20_POLY1305. Stored as ciphertext by the microservice (which cannot decrypt it). |
-| **PN-counter CRDT** | A conflict-free replicated data type for counters that support both increment and decrement. The escrow ledger uses this pattern. |
-| **Qpeek** | Burst repair bandwidth: total network transfer required when one provider fails. At N=1,000, 50 GB/provider: ~793 GB. |
-| **r** | Number of parity fragments. Fixed at 40 in V2. Analytically optimal per Giroire Formula 4. |
-| **r0** | Lazy repair trigger buffer. Fixed at 8. Repair fires when available fragments drop to s+r0=24, not at every loss. Reduces bandwidth by ~38x vs eager repair. |
-| **RS(s, n)** | Reed-Solomon erasure code with s data shards and n total shards. V2: RS(16, 56). Systematic form: first 16 output shards are identity-mapped from the AONT package. |
-| **RTO** | Retransmission Timeout. Per-provider: `AVG + 4 x VAR` of recent audit response latencies. New providers use pool median. |
-| **s** | Number of data (reconstruction threshold) shards. Fixed at 16. |
-| **Segment** | A 14 MB unit of file data (56 x 256 KB). Files larger than 14 MB are split into multiple segments, each processed independently. |
-| **Silent departure** | A provider absent >= 72 hours without announcement. Triggers escrow seizure and immediate repair. |
-| **vLog** | The append-only Value Log in the WiscKey storage engine. Fixed-size entries of 262,212 bytes. All reads verify `SHA-256(chunk_data) == content_hash`. |
-| **Vetting period** | 4-6 months after provider registration. 60-day escrow hold, 50% release cap. Ends after 80 consecutive audit passes. |
-| **WiscKey** | Key-value separation architecture: small index in RocksDB, large values in an append-only log. Reduces write amplification from 10-14x to ~1.0 at 256 KB values. |
 
 ---
 
@@ -192,9 +159,9 @@ passphrase + owner_id
     v  Argon2id (t=3, m=64 MB, p=4)
     master_secret ──────────────────── BIP-39 mnemonic (offline backup)
     |
-    +-- HKDF(\"vyomanaut-file-v1\" || file_id)     --> file_key
-    +-- HKDF(\"vyomanaut-pointer-v1\" || file_id)   --> pointer file encryption key
-    +-- HKDF(\"vyomanaut-keystore-v1\")              --> keystore encryption key
+    +-- HKDF("vyomanaut-file-v1" || file_id)     --> file_key
+    +-- HKDF("vyomanaut-pointer-v1" || file_id)   --> pointer file encryption key
+    +-- HKDF("vyomanaut-keystore-v1")              --> keystore encryption key
 ```
 
 The AONT key K is **not** in this hierarchy. It is embedded in the erasure-coded fragments and recovered automatically when k=16 shards are assembled.
@@ -212,7 +179,7 @@ The four critical paths define the MVP boundary. Each path is a sequence of step
 ```
 Plaintext
   --> [Pad if < 4 MB]              FR-008
-  --> [Segment at 14 MB]           architecture.md $10
+  --> [Segment at 4 MB]            architecture.md §10
   --> [AONT transform]             ADR-019, ADR-022 | Milestone 1
   --> [RS(16,56) dispersal]        ADR-003          | Milestone 1
   --> [56 chunks of 256 KB]
@@ -392,7 +359,7 @@ These are deliberately excluded. They are recorded here so no one builds them ac
 | Hitchhiker repair bandwidth optimisation | V3 | BWavg is ~39 Kbps at launch scale, well under the 100 Kbps budget |
 | Mobile providers | V3 | BWavg at MTTF=90d is ~130 Kbps, exceeding the budget; iOS/Android background limits unresolved |
 | International payments (Stripe Connect) | Post-India-launch | `PaymentProvider` interface is ready; implementation requires multi-jurisdiction compliance |
-| File versioning | Never in V2 | Files are immutable by design (Trade-off 15) |
+| File versioning | Never in V2 | Files are immutable by design |
 | Convergent encryption / deduplication | Never | Privacy is the product (Trade-off 15, ADR-022) |
 | Geographic proximity routing (Coral DSHT) | V3 | Inter-city latency is homogeneous in India at launch scale |
 | Upload optimality threshold (cancel slow shards) | V3 | Requires cancel signals to slow providers; complexity not justified at launch |
@@ -483,8 +450,6 @@ Key constraints to enforce from day one:
 | `audit_receipts.challenge_nonce`: UNIQUE index | ADR-015 | Idempotent retry |
 | `providers.last_known_multiaddrs`: JSONB column | ADR-028 | Heartbeat-maintained addresses |
 
-> **Cross-document correction:** `architecture.md` Section 14 shows `challenge_nonce BYTEA(32)` — this is incorrect. The schema must use `BYTEA(33)` (32-byte HMAC + 1-byte version prefix per ADR-027). Fix `architecture.md` before or during M0.
-
 **Provider daemon simulation mode (FR-055, FR-056):**
 
 The `--sim-count=N` flag launches N independent provider instances in one process. Each gets its own:
@@ -566,10 +531,11 @@ Key hierarchy (ADR-019, ADR-020):
 | Derivation | Function | Output |
 |---|---|---|
 | Master secret | `Argon2id(passphrase, owner_id, t=3, m=65536, p=4)` | `[32]byte` |
-| File key | `HKDF-SHA256(master_secret, salt=owner_id, info=\"vyomanaut-file-v1\"+file_id)` | `[32]byte` |
-| Pointer enc key | `HKDF-SHA256(master_secret, salt=owner_id, info=\"vyomanaut-pointer-v1\"+file_id)` | `[32]byte` |
-| Keystore enc key | `HKDF-SHA256(master_secret, salt=owner_id, info=\"vyomanaut-keystore-v1\")` | `[32]byte` |
+| File key | `HKDF-SHA256(master_secret, salt=owner_id, info="vyomanaut-file-v1"+file_id)` | `[32]byte` |
+| Pointer enc key | `HKDF-SHA256(master_secret, salt=owner_id, info="vyomanaut-pointer-v1"+file_id)` | `[32]byte` |
+| Keystore enc key | `HKDF-SHA256(master_secret, salt=owner_id, info="vyomanaut-keystore-v1")` | `[32]byte` |
 
+>**Note:** The BIP-39 mnemonic generation is also scoped here 
 AES-NI detection at package init via CPUID (x86) — sets a package-level constant.
 
 **ChaCha20 AONT pass** (no AES-NI path, ADR-019):
@@ -579,7 +545,7 @@ K = SecureRandom(256 bits)
 for i, word in enumerate(16-byte words of segment + canary):
     c_i = word XOR ChaCha20(key=K, counter=i/4, nonce=zeros)[word_offset]
 h = SHA-256(c_0 || ... || c_s)
-c_{s+1} = K XOR h[:32]
+c_{s+1} = K XOR h
 ```
 
 **AES-256-CTR AONT pass** (AES-NI path, ADR-019):
@@ -589,7 +555,7 @@ K = SecureRandom(256 bits)
 for i, word in enumerate(words):
     c_i = word XOR AES-256-ECB(K, i+1)    // counter mode
 h = SHA-256(c_0 || ... || c_s)
-c_{s+1} = K XOR h[:32]
+c_{s+1} = K XOR h
 ```
 
 **Canary:** 16-byte fixed value appended before AONT. Verified during decode.
@@ -644,6 +610,8 @@ All tests use table-driven subtests. Fuzzing is strongly encouraged for the AONT
 | `TestArgon2idDeterminism` | Same passphrase + owner_id always produces same master_secret |
 | `TestPointerFileEncryption` | Encrypt then decrypt, AAD verified, tampered ciphertext fails |
 
+>**Note:** Also test AONT boundary condition where exactly s+1 codewords succeed, exactly s codewords fail.
+
 ### Benchmarks (must pass before milestone closes)
 
 Run on minimum-spec hardware (dual-core, no AES-NI, 2 GB RAM, HDD) per `docs/research/benchmarking-protocol.md`:
@@ -652,6 +620,7 @@ Run on minimum-spec hardware (dual-core, no AES-NI, 2 GB RAM, HDD) per `docs/res
 |---|---|---|
 | `BenchmarkAONTEncode14MB/ChaCha20` | p50 <= 200 ms, p99 <= 400 ms | Q16-1, NFR-009 |
 | `BenchmarkArgon2id` | p50 <= 500 ms at t=3, m=64 MB | Q18-1, NFR-010 |
+| `BenchmarkRSencoding` | Decided after reading | NFR-033 |
 
 Record hardware spec alongside benchmark output. If Argon2id fails on minimum-spec, apply the fallback protocol in `docs/research/benchmarking-protocol.md` Q18-1 and update ADR-020 with the confirmed parameters.
 
@@ -756,7 +725,7 @@ receive (chunk_id, challenge_nonce)
   --> read 262,212 bytes from vLog at vlog_offset (one random read)
   --> verify SHA-256(chunk_data) == content_hash --> FAIL with corruption code if mismatch
   --> response_hash = SHA-256(chunk_data || challenge_nonce)
-  --> return response_hash
+  --> return response_hash to the audit layer to build signed receipt
 ```
 
 ### Tests
@@ -1002,11 +971,11 @@ If microservice crashes between Phase 1 and Phase 2: orphaned PENDING row is gar
 | `provider_id` | UUID NOT NULL | Which provider responded |
 | `challenge_nonce` | BYTEA(33) NOT NULL | 1 version byte + 32 HMAC bytes |
 | `server_challenge_ts` | TIMESTAMPTZ NOT NULL | Set by server; prevents backdating |
-| `response_hash` | BYTEA(32) NOT NULL | SHA-256(chunk_data \|\| nonce) |
+| `response_hash` | BYTEA(32) NOT NULL | NULL for TIMEOUT and PENDING; SHA-256(chunk_data \|\| nonce) |
 | `response_latency_ms` | INT NOT NULL | JIT retrieval detector |
 | `audit_result` | TEXT CHECK (IN 'PASS','FAIL','TIMEOUT') | NULL = in-flight PENDING |
-| `provider_sig` | BYTEA(64) NOT NULL | Ed25519 over all fields |
-| `service_sig` | BYTEA(64) NOT NULL | Ed25519 countersignature |
+| `provider_sig` | BYTEA(64) NOT NULL | NULL for TIMEOUT and PENDING; Ed25519 over all fields |
+| `service_sig` | BYTEA(64) NOT NULL | NULL during the PENDING phase; Ed25519 countersignature |
 
 Additional columns: `service_countersign_ts TIMESTAMPTZ NOT NULL`, `jit_flag BOOLEAN NOT NULL DEFAULT false`, `abandoned_at TIMESTAMPTZ`.
 
@@ -1119,6 +1088,8 @@ On match:
   3. Seize escrow (no-op until M6 is complete)
   4. Enqueue repair jobs for all affected chunks
 ```
+
+>**Note:** A flow must be synthesised for providers in the vetting stage.
 
 *Repair scheduler — lazy trigger (ADR-004):*
 
@@ -1293,7 +1264,7 @@ For each active provider:
 
 ```go
 type PaymentProvider interface {
-    InitiateEscrow(ownerID, amount, contractID string) error
+    InitiateEscrow(ownerID string, amount int64, contractID string) error
     ReleaseEscrow(providerID string, amount int64, auditPeriod string) error
     Penalise(providerID string, amount int64, reason string) error
     GetBalance(entityID string) (int64, error)

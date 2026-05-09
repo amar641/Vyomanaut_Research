@@ -354,7 +354,6 @@ components:
           enum:
             - owner
             - provider
-            - null
           description: |
             Role encoded in the JWT. `null` when `is_new_entity = true` because
             the role is not yet established — it is set during the register call.
@@ -596,8 +595,9 @@ components:
             `GET /api/v1/owner/{owner_id}/balance`. (FR-059)
         idempotency_key:
           type: string
-          minLength: 10
+          minLength: 64
           maxLength: 64
+          pattern: '^[0-9a-f]{64}$'
           description: |
             Client-generated idempotency key. Format: SHA-256(owner_id || withdrawal_request_id),
             hex-encoded. Prevents double-withdrawal on network retry. (FR-059)
@@ -647,7 +647,7 @@ components:
         declared_storage_gb:
           type: integer
           minimum: 10
-          maximum: 10000
+          maximum: 100000
           description: |
             Storage capacity the provider is committing. The assignment service will
             not assign chunks that would exceed this cap (FR-030). Must be ≥ 10 GB.
@@ -2679,9 +2679,8 @@ paths:
         The provider daemon calls this endpoint after computing a response to an audit
         challenge. The microservice:
         1. Verifies `provider_sig` against the registered `ed25519_public_key`.
-        2. Looks up the expected `response_hash` from the chunk assignment.
-        3. Executes the crash-safe two-phase write: INSERT PENDING → UPDATE to PASS/FAIL.
-        4. Returns the `service_sig` countersignature. Daemon stores this as payment evidence.
+        2. Executes the crash-safe two-phase write: INSERT PENDING → UPDATE to PASS/FAIL.
+        3. Returns the `service_sig` countersignature. Daemon stores this as payment evidence.
 
         **Idempotent:** duplicate submissions with the same `challenge_nonce` return the
         existing countersignature without re-processing. (ADR-015, FR-039)
@@ -2699,7 +2698,7 @@ paths:
         "200":
           description: |
             Receipt recorded. Returns PASS or FAIL with the microservice countersignature.
-            The provider must store `service_sig` as payment evidence. (ADR-015)
+            The provider must store `service_sig` as payment evidence. (ADR-015); idempotent: true
           content:
             application/json:
               schema:
@@ -2710,17 +2709,6 @@ paths:
           $ref: '#/components/responses/401Unauthorized'
         "403":
           $ref: '#/components/responses/403Forbidden'
-        "409":
-          description: |
-            Duplicate `challenge_nonce`. The audit receipt for this nonce already exists
-            and its result is final (PASS or FAIL). The existing countersignature is
-            returned so the provider daemon can store it without re-submitting.
-            This is an **idempotent success path**, not an error — the daemon should
-            treat this identically to a 200 response. (ADR-015)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/AuditReceiptSubmitResponse'
 
   # ────────────────────────────
   # Admin

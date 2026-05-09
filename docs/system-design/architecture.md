@@ -8,20 +8,44 @@
 **Decisions index:** `docs/decisions/README.md`  
 **Research index:** `docs/research/reading-list.md`
 
+> **Note:** This document is not a build plan. It does not say what to build first or how long things take. It describes what the finished system looks like.
+
 ---
 
-## Document Purpose and Audience
+## Terminology and Glossary
 
-This document describes the architecture of Vyomanaut V2. It answers three questions a new engineer needs before writing a single line of code: what the system is, how its parts connect, and why each design choice was made.
-
-Every significant decision in this document traces to an Architecture Decision Record (ADR) in `docs/decisions/`. Where this document and an ADR conflict, the ADR wins — it was written with more context. Raise any conflict before building.
-
-This document is for:
-- **Engineers building the system** — to understand what they are building and where their component fits.
-- **Engineers reviewing code** — to check a proposed change against the architecture.
-- **Future engineers joining the project** — to get up to speed without reading all 41 research papers.
-
-Note: This document is not a build plan. It does not say what to build first or how long things take. It describes what the finished system looks like.
+| Term | Definition |
+|---|---|
+| **AONT** | All-or-Nothing Transform. An encryption scheme where the key K is embedded in the ciphertext and can only be recovered by assembling all codewords. Used before erasure coding so that possessing fewer than k=16 fragments reveals nothing. |
+| **ASN** | Autonomous System Number. Identifies an ISP or network operator. The 20% ASN cap ensures no correlated provider group holds more than ~11 of 56 fragments of any file. |
+| **BWavg** | Steady-state repair bandwidth per provider (Kbps). Computed via Giroire Formula 1. Target: <= 100 Kbps. At MTTF=300d, ~39 Kbps. |
+| **Canary** | A fixed 16-byte value appended to plaintext before AONT encoding. Verified on decode to detect corruption. If the canary fails, the segment is corrupt. |
+| **Chunk** | A 256 KB encrypted fragment. The atomic unit of storage, audit, and repair. Each file segment produces 56 chunks. |
+| **Circuit Relay v2** | A libp2p protocol for routing traffic through an intermediary when direct connections are impossible (symmetric NAT). |
+| **DCUtR** | Direct Connection Upgrade through Relay. A libp2p NAT hole-punching protocol with 97.6% first-attempt success rate for cone NAT. |
+| **DHT** | Distributed Hash Table. Specifically, Kademlia. Used for chunk-address lookup on the data plane. Provider discovery goes through the microservice, not the DHT. |
+| **Ed25519** | A digital signature scheme. Used for audit receipts (both provider and microservice sign), pointer file integrity, and peer identity. |
+| **Escrow** | Funds held by the system on behalf of providers. Balance is computed, never stored: `SUM(DEPOSIT) - SUM(RELEASE + SEIZURE)`. Integer paise only. |
+| **Giroire Formula** | A family of analytical formulas for computing data loss rate, repair bandwidth, and burst transfer volume in lazy-repair erasure-coded systems. From [Paper 10](../research/paper-10-giroire-lazy.md). |
+| **HKDF** | HMAC-based Key Derivation Function (SHA-256). Derives file keys, pointer keys, and keystore keys from the master secret. |
+| **JIT flag** | Just-In-Time retrieval detection. Set when a provider responds faster than `0.3x` the expected transfer time, suggesting they did not read from local disk. |
+| **K (AONT key)** | A fresh 256-bit random key generated per segment. Embedded in the erasure-coded data via `c_{s+1} = K XOR SHA-256(all codewords)`. Never stored or transmitted separately. |
+| **lf** | Fragment (chunk) size. Fixed at 256 KB (262,144 bytes) in V2. |
+| **Master secret** | `Argon2id(passphrase, owner_id)`. The root of the data owner's key hierarchy. Never written to disk or transmitted. |
+| **MTTF** | Mean Time To Failure. For V2 desktop providers: target 300 days, minimum acceptable 180 days. |
+| **Pointer file** | A per-file metadata structure containing provider IDs, chunk content addresses, and erasure parameters. Encrypted with AEAD_CHACHA20_POLY1305. Stored as ciphertext by the microservice (which cannot decrypt it). |
+| **PN-counter CRDT** | A conflict-free replicated data type for counters that support both increment and decrement. The escrow ledger uses this pattern. |
+| **Qpeek** | Burst repair bandwidth: total network transfer required when one provider fails. At N=1,000, 50 GB/provider: ~793 GB. |
+| **r** | Number of parity fragments. Fixed at 40 in V2. Analytically optimal per Giroire Formula 4. |
+| **r0** | Lazy repair trigger buffer. Fixed at 8. Repair fires when available fragments drop to s+r0=24, not at every loss. Reduces bandwidth by ~38x vs eager repair. |
+| **RS(s, n)** | Reed-Solomon erasure code with s data shards and n total shards. V2: RS(16, 56). Systematic form: first 16 output shards are identity-mapped from the AONT package. |
+| **RTO** | Retransmission Timeout. Per-provider: `AVG + 4 x VAR` of recent audit response latencies. New providers use pool median. |
+| **s** | Number of data (reconstruction threshold) shards. Fixed at 16. |
+| **Segment** | A 4 MB unit of file data (56 x 256 KB). Files larger than 4 MB are split into multiple segments, each processed independently. |
+| **Silent departure** | A provider absent >= 72 hours without announcement. Triggers escrow seizure and immediate repair. |
+| **vLog** | The append-only Value Log in the WiscKey storage engine. Fixed-size entries of 262,212 bytes. All reads verify `SHA-256(chunk_data) == content_hash`. It serialises all appends through a single writer goroutine. Concurrent upload goroutines do not write to the vLog file handle directly. |
+| **Vetting period** | 4-6 months after provider registration. 60-day escrow hold, 50% release cap. Ends after 80 consecutive audit passes. |
+| **WiscKey** | Key-value separation architecture: small index in RocksDB, large values in an append-only log. Reduces write amplification from 10-14x to ~1.0 at 256 KB values. |
 
 ---
 
@@ -319,7 +343,7 @@ Before any data leaves the data owner's device, it passes through a four-stage p
 
 ### Segmentation
 
-Files larger than 14 MB are split into multiple segments before encoding. Each segment is at most 14 MB (56 × 256 KB). Every segment is processed independently through Stages 1–4 below. The pointer file contains one entry per segment, including the provider list and chunk IDs for that segment's 56 fragments. Retrieval reconstructs each segment independently and concatenates them in order to rebuild the original file. There is no cross-segment state — losing all 56 fragments of one segment does not affect any other segment's recoverability.
+Files larger than 4 MB are split into multiple segments before encoding. Each segment is at most 4 MB (56 × 256 KB). Every segment is processed independently through Stages 1–4 below. The pointer file contains one entry per segment, including the provider list and chunk IDs for that segment's 56 fragments. Retrieval reconstructs each segment independently and concatenates them in order to rebuild the original file. There is no cross-segment state — losing all 56 fragments of one segment does not affect any other segment's recoverability.
 
 ### Stage 1 — AONT encryption
 
