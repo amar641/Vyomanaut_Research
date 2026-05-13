@@ -2676,9 +2676,9 @@ paths:
       tags: [Audit]
       summary: Submit a signed audit receipt (providers only)
       description: |
-        The provider daemon calls this endpoint after computing a response to an audit
-        challenge. The microservice:
-        1. Verifies `provider_sig` against the registered `ed25519_public_key`.
+        **Revalute the need for this route. Remove or repurpose it **
+        The microservice opens a QUIC stream to the provider, sends ChallengeRequest, receives ChallengeResponse on the same stream, and the receipt is complete. This is a request-response over a single stream. The microservice:
+        1. Verifies `provider_sig` against the registered `ed25519_public_key` (receipt fields).
         2. Executes the crash-safe two-phase write: INSERT PENDING → UPDATE to PASS/FAIL.
         3. Returns the `service_sig` countersignature. Daemon stores this as payment evidence.
 

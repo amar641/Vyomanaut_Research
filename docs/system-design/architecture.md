@@ -534,7 +534,7 @@ The provider receives the challenge and:
 
 ### Receipt recording
 
-The microservice verifies the response_hash, then writes one row to `audit_receipts`. The table is INSERT-only — no row is ever updated or deleted, enforced by Postgres row security policy. Both the provider and microservice sign the receipt with Ed25519. ([ADR-017](../decisions/ADR-017-audit-receipt-schema.md), [ADR-015](../decisions/ADR-015-audit-trail.md))
+The microservice verifies the provider's Ed25519 signature over the receipt fields, then writes one row to `audit_receipts`. The table is INSERT-only — no row is ever updated or deleted, enforced by Postgres row security policy. But (audit_result, service_sig, service_countersign_ts) fields are treated as an exeption. Both the provider and microservice sign the receipt with Ed25519. ([ADR-017](../decisions/ADR-017-audit-receipt-schema.md), [ADR-015](../decisions/ADR-015-audit-trail.md))
 
 ### The 12-field receipt schema
 

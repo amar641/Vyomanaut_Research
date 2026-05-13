@@ -816,7 +816,8 @@ floating-point arithmetic anywhere in this table or in any code path that reads 
 CREATE TYPE escrow_event_type AS ENUM (
     'DEPOSIT',   -- data owner funds escrow; triggers on Razorpay webhook
     'RELEASE',   -- monthly payment released to provider after multiplier applied
-    'SEIZURE'    -- all held earnings seized on silent departure (ADR-024)
+    'SEIZURE',   -- all held earnings seized on silent departure (ADR-024)
+    'REVERSAL'   -- 
 );
 
 CREATE TABLE escrow_events (
@@ -1240,6 +1241,8 @@ CREATE UNIQUE INDEX ON mv_provider_scores (provider_id);
 -- ── Escrow balance per provider ────────────────────────────────────────────────
 -- Used by: release computation, provider dashboard endpoint.
 -- Refreshed: after each DEPOSIT, RELEASE, or SEIZURE event.
+-- Update: WE MADE AN AMMEND ADDING 'REVERSAL', 
+-- Please make these changes: the balance formula becomes: SUM(DEPOSIT + REVERSAL) - SUM(RELEASE + SEIZURE). The idempotency key for a REVERSAL event is SHA-256("reversal" || original_idempotency_key), which is deterministic given the original payout's key.
 
 CREATE MATERIALIZED VIEW mv_provider_escrow_balance AS
 SELECT

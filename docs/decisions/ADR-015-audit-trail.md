@@ -64,7 +64,7 @@ Protocol:
    service_countersign_ts = NOW().
 4. The countersignature is returned to the provider.
 
-<!-- > **Note:** According to [ADR-017](./ADR-017-audit-receipt-schema.md) the Postgres row security policy prohibits row Updates. Here audit_result column specifically is treated as an exception allowing UPDATE and no DELETE ever -->
+> **Note:** According to [ADR-017](./ADR-017-audit-receipt-schema.md) the Postgres row security policy prohibits row Updates. Here audit_result column specifically is treated as an exception allowing UPDATE (Only for PENDING state) and no DELETE ever
 
 If the microservice crashes after step 1 but before step 4:
 - The provider receives no countersignature.
