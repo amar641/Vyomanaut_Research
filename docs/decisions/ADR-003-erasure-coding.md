@@ -53,9 +53,10 @@ jointly with the 20% ASN cap in [ADR-014](./ADR-014-adversarial-defences.md). Th
 correctly predicts the mean; [Paper 38](../research/paper-38-nath-correlated-failures.md) (Nath et al.) proves that large-m erasure
 schemes can have their superiority ordering reversed under real-world correlated
 failures. With the 20% ASN cap, the maximum correlated failure event is bounded at
-12 shards (ceil(0.20 × 56)). Surviving shards after the worst case: 44 — which is
+11 shards. Surviving shards after the worst case: 44 — which is
 28 above the s=16 reconstruction floor. This makes the reversal condition from
 [Paper 38](../research/paper-38-nath-correlated-failures.md) categorically impossible at our parameters. An engineer deploying ADR-003 without ADR-014 does not achieve the stated LossRate guarantee.
+
 - Full reconstruction requires contacting all 16 surviving fragments — not bandwidth-optimal
 - MSR codes would reduce repair bandwidth further but require more research
 
