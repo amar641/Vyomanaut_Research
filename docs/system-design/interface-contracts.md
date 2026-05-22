@@ -1682,3 +1682,9 @@ coordination across the affected components before deployment**.
 - Any change to the key derivation formula (`HMAC-SHA256(chunk_hash, file_owner_key)`) is a
   **network-breaking change** requiring a full re-indexing of all DHT records. This is a V3+
   concern; do not change the formula in V2.
+
+
+
+
+
+  

@@ -1,6 +1,6 @@
 # Vyomanaut V2 — Canonical Data Model
 
-**Status:** Authoritative — backend, DBA, and query authors follow this document.
+**Status:** Authoritative; all ADRs and requirements are superior
 Where this document and an ADR conflict, file an issue; do not build around the conflict.
 **Version:** 1.0
 **Date:** April 2026
@@ -191,7 +191,7 @@ erDiagram
     providers     ||--o{ audit_receipts   : "challenged in"
     providers     ||--o{ escrow_events    : "earns / loses"
     audit_periods ||--o{ escrow_events    : "releases from"
-    chunk_assignments ||--o{ audit_receipts : "audited via"
+    chunk_assignments }o..o{ audit_receipts : "logically linked via chunk_id + provider_id (no FK)"
     segments      ||--o{ repair_jobs      : "repaired through"
     providers     ||--o{ repair_jobs      : "departed from"
 ```
@@ -361,27 +361,37 @@ CREATE TABLE providers (
     -- heartbeat (ADR-028).
 
     -- ── Performance counters (ADR-006, ADR-014) ──────────────────────────────
-    p95_throughput_kbps     FLOAT           NOT NULL DEFAULT 0,
+    p95_throughput_kbps     FLOAT          NULL,
     -- 95th-percentile upload throughput in KB/s measured during vetting audits.
     -- Used to derive the per-provider audit deadline:
     --   deadline_ms = (chunk_size_kb / p95_throughput_kbps) × 1500
     -- Seeded to 0 (uses pool median) until vetting accumulates enough samples.
     -- Updated via EWMA after every PASS audit response (ADR-014).
+    -- NULL = unestablished; application substitutes pool median
+    -- The previous state was set to NOT NULL and DEFAULT 0 but if any code path computes deadline_ms = (256 / 0) × 1.5 before checking for 0, it produces a division-by-zero or infinite deadline.
 
-    avg_rtt_ms              FLOAT           NOT NULL DEFAULT 2000,
+    avg_rtt_ms              FLOAT           NULL,
     -- EWMA mean of recent audit response latencies. Seeded to 2000ms (2 seconds)
     -- for new providers, which is conservative but safe. Used in the per-provider
     -- RTO formula: RTO = avg_rtt_ms + 4 × var_rtt_ms (ADR-006).
+    -- NULL = unestablished; application substitutes pool median
+    -- The default was set to 2000ms which was a hard-coded guess, not the pool median. As the network's actual median shifts, this default becomes increasingly wrong
 
     var_rtt_ms              FLOAT           NOT NULL DEFAULT 0,
     -- EWMA variance of recent audit response latencies. Zero for new providers
     -- (unknown variance). RTO is dominated by avg_rtt_ms until variance is
     -- established.
+    -- zero variance is safe as initial assumption
 
     rto_sample_count        INT             NOT NULL DEFAULT 0,
     -- Number of audit responses that have updated avg_rtt_ms and var_rtt_ms.
     -- Below 5, the scheduler substitutes the pool-median RTO. At and above 5,
     -- the per-provider formula is used (ADR-006).
+
+    first_chunk_assignment_at   TIMESTAMPTZ,
+    -- NULL until the assignment service assigns the provider's first chunk.
+    -- The vetting advancement check compares NOW() - first_chunk_assignment_at >= INTERVAL '120 days' (FR-026).
+    -- Cannot use created_at: registration → first assignment gap is variable (minimum 24h cooling).
 
     -- ── Vetting counters (ADR-005) ────────────────────────────────────────────
     consecutive_audit_passes INT            NOT NULL DEFAULT 0,
@@ -437,7 +447,7 @@ before upload and split into segments. The microservice stores only the encrypte
 pointer file ciphertext — it cannot decrypt it (ADR-020, zero-knowledge property).
 
 ```sql
-CREATE TYPE file_status AS ENUM ('ACTIVE', 'DELETED');
+CREATE TYPE file_status AS ENUM ('ACTIVE', 'DELETION_PENDING', 'DELETED');
 
 CREATE TABLE files (
     -- ── Identity ─────────────────────────────────────────────────────────────
@@ -464,6 +474,17 @@ CREATE TABLE files (
     pointer_tag         BYTEA           NOT NULL CHECK (octet_length(pointer_tag) = 16),
     -- 16-byte Poly1305 authentication tag. Verified with constant-time comparison
     -- before any decryption attempt is made (NFR-019).
+
+    -- ── File name (nullable) ─────────────────────────────────────────────────────────
+    display_name_ciphertext  BYTEA,
+    -- AEAD_CHACHA20_POLY1305 ciphertext of the user-provided file name.
+    -- Key = HKDF(master_secret, "vyomanaut-filename-v1" || file_id).
+    -- NULL is acceptable if the owner provides no label (files are identified by
+    -- file_id in the CLI). Non-null for the web/desktop UI file list view (FR-019).
+    -- The microservice stores this blindly; it cannot read the file name.
+    display_name_nonce       BYTEA     CHECK (octet_length(display_name_nonce) = 12 OR display_name_nonce IS NULL),
+
+    display_name_tag         BYTEA     CHECK (octet_length(display_name_tag) = 16 OR display_name_tag IS NULL),
 
     -- ── File metadata ─────────────────────────────────────────────────────────
     original_size_bytes BIGINT          NOT NULL CHECK (original_size_bytes > 0),
@@ -566,17 +587,8 @@ CREATE TABLE chunk_assignments (
     -- DELETED. Never cleared. See nullable justification §8.6.
 
     -- ── Constraints ──────────────────────────────────────────────────────────
-    CONSTRAINT chunk_assignments_one_active_per_shard
-        -- REQUIRES POSTGRESQL 15+: NULLS NOT DISTINCT syntax was introduced in PG 15.
-        -- On PG 14, replace with a UNIQUE partial index:
-        --   CREATE UNIQUE INDEX ON chunk_assignments (segment_id, shard_index)
-        --   WHERE status IN ('ACTIVE', 'REPAIRING');
-        UNIQUE NULLS NOT DISTINCT (segment_id, shard_index)
-        WHERE (status = 'ACTIVE' OR status = 'REPAIRING'),
-    -- At most one ACTIVE or REPAIRING assignment per (segment, shard_index).
-    -- A second provider holding the same shard as a repair replacement is fine
-    -- during the transition, but two simultaneous ACTIVE assignments for the
-    -- same shard position would produce payment for duplicated work.
+    -- Remove from CREATE TABLE:
+    -- CONSTRAINT chunk_assignments_one_active_per_shard ...
 
     CONSTRAINT chunk_assignments_one_per_provider_per_chunk
         UNIQUE (chunk_id, provider_id)
@@ -586,10 +598,25 @@ CREATE TABLE chunk_assignments (
     -- unlikely with fresh AONT keys per segment.)
 );
 
+-- Necessary to ensure that the soft-delete of chunk_assignments works over a hard remove
+CREATE VIEW active_chunk_assignments AS
+SELECT *
+FROM chunk_assignments
+WHERE status = 'ACTIVE';
+
+-- Grant SELECT on this view to the vyomanaut_app role.
+-- Revoke direct SELECT on chunk_assignments from vyomanaut_app for the
+-- challenge scheduler path. The scheduler physically cannot see DELETED rows.
+
+
 COMMENT ON TABLE chunk_assignments IS
     'Routing table: which provider holds which shard of which segment. '
     '20% ASN cap enforced at INSERT time by the assignment service (ADR-014). '
-    'On provider departure: rows are hard-removed to stop challenge issuance (ADR-007).';
+    'On provider SILENT/ANNOUNCED departure: status → DELETED, challenge issuance stops.'
+    'Physical deletion is NOT performed — historical assignment data is preserved for '
+    'audit reconciliation. ADR-007 language ("hard-removed") refers to the effect on '
+    'challenge routing, not physical row deletion. '
+    'On file owner deletion: status → PENDING_DELETION → DELETED after provider GC confirms.';
 COMMENT ON COLUMN chunk_assignments.chunk_id IS
     'SHA-256(shard_data). RocksDB lookup key on the provider daemon (ADR-023). '
     'Also the audit receipt''s reference to the challenged content.';
@@ -663,6 +690,8 @@ proof event — PASS, FAIL, TIMEOUT, or in-flight PENDING — creates exactly on
 INSERT here. No row is ever updated except during the two-phase PENDING → final
 write (ADR-015). No row is ever deleted (Invariant 1, ADR-015, NFR-021).
 
+>**NOTE:**-- No FK to chunk_assignments. chunk_assignments may be soft-deleted on provider departure while audit_receipts must remain permanently (Invariant 1). The logical link is: chunk_assignments.chunk_id = audit_receipts.chunk_id AND chunk_assignments.provider_id = audit_receipts.provider_id. This is enforced at the application layer only.
+
 ```sql
 -- ── Audit result type ─────────────────────────────────────────────────────────
 -- PASS / FAIL / TIMEOUT are the three terminal states. The column is nullable
@@ -726,6 +755,11 @@ CREATE TABLE audit_receipts (
     -- Using audit_result_type (ENUM) rather than TEXT ensures Postgres rejects
     -- invalid strings at the wire protocol level, not just at constraint check time.
 
+    address_was_stale  BOOLEAN  NOT NULL DEFAULT FALSE,
+    -- TRUE if challenge was dispatched via DHT fallback (providers.multiaddr_stale = TRUE
+    -- at dispatch time). TIMEOUTs with this flag set do NOT reset consecutive_audit_passes.
+    -- We keep 80 consecutive passes. With a mitigation: if audit_result = 'TIMEOUT' and providers.multiaddr_stale = TRUE at the time of the challenge (meaning the scheduler fell back to DHT because no heartbeat was received), do not reset the consecutive counter. A TIMEOUT caused by a known-stale address is not evidence of provider failure; it is evidence of the DHT fallback not working. The reset should only trigger on TIMEOUTs where the microservice had a fresh heartbeat address and the provider still did not respond.
+
     -- ── Signatures (dual Ed25519, ADR-017) ───────────────────────────────────
     provider_sig            BYTEA           CHECK (
                                 octet_length(provider_sig) = 64 OR provider_sig IS NULL
@@ -738,11 +772,12 @@ CREATE TABLE audit_receipts (
     service_sig             BYTEA           CHECK (
                                 octet_length(service_sig) = 64 OR service_sig IS NULL
                             ),
-    -- Ed25519 countersignature by the microservice over (provider_sig || service_ts).
-    -- NULL during the PENDING phase (written in Phase 2 of the two-phase commit).
-    -- For TIMEOUT rows: the microservice signs its own TIMEOUT determination;
-    -- there is no provider_sig to countersign, so service_sig covers the
-    -- timeout declaration fields directly. See §8.11.
+    -- Ed25519 countersignature by the microservice:
+    --   For PASS/FAIL: Ed25519(microservice_key, provider_sig || service_countersign_ts)
+    --   For TIMEOUT:   Ed25519(microservice_key, provider_id || chunk_id || challenge_nonce
+    --                          || server_challenge_ts || 'TIMEOUT' || service_countersign_ts)
+    --   For PENDING:   NULL (Phase 2 not yet executed)
+    -- The two signing inputs are different. Verifiers must branch on audit_result. See §8.11.
 
     service_countersign_ts  TIMESTAMPTZ,
     -- NULL during PENDING. Set in Phase 2 alongside service_sig. See §8.12.
@@ -865,7 +900,39 @@ COMMENT ON COLUMN escrow_events.idempotency_key IS
 
 ---
 
-### 4.9 `repair_jobs`
+### 4.9 `owner_escrow_events`
+
+FR-021 requires a balance view showing "current balance, amount reserved for active files, amount available for withdrawal." FR-059 requires withdrawal. FR-006 requires deposit tracking. FR-014 requires checking if the owner has sufficient balance before upload.
+None of these can be computed from the current schema. The owners table has no balance information. So there is need for an owner_escrow_events table.
+
+```sql
+CREATE TYPE owner_escrow_event_type AS ENUM (
+    'DEPOSIT',      -- data owner funds escrow via UPI Smart Collect 2.0
+    'CHARGE',       -- monthly storage deduction per active file (per-audit-pass credits)
+    'WITHDRAWAL',   -- owner withdraws available balance to their bank account
+    'REFUND'        -- file deleted early; unused prepaid storage refunded
+);
+
+CREATE TABLE owner_escrow_events (
+    event_id            UUID                        PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner_id            UUID                        NOT NULL REFERENCES owners (owner_id),
+    event_type          owner_escrow_event_type     NOT NULL,
+    amount_paise        BIGINT                      NOT NULL CHECK (amount_paise > 0),
+    file_id             UUID                        REFERENCES files (file_id),
+    -- Non-null for CHARGE and REFUND events, linking the payment to the specific file.
+    idempotency_key     VARCHAR(64)                 NOT NULL UNIQUE,
+    -- SHA-256(owner_id || razorpay_webhook_id) for DEPOSIT
+    -- SHA-256(owner_id || file_id || billing_period) for CHARGE
+    created_at          TIMESTAMPTZ                 NOT NULL DEFAULT NOW()
+);
+
+-- Balance query:
+-- SUM(DEPOSIT) - SUM(CHARGE + WITHDRAWAL) + SUM(REFUND) per owner_id
+```
+
+---
+
+### 4.10 `repair_jobs`
 
 Repair jobs are created when fragment availability for a segment drops to the lazy
 repair threshold (s + r0 = 24) or lower. The priority column enforces the scheduler
@@ -880,6 +947,7 @@ CREATE TYPE repair_trigger_type AS ENUM (
 );
 
 CREATE TYPE repair_priority AS ENUM (
+    'EMERGENCY',            -- EMERGENCY_FLOOR: s=16, immediate, front of queue
     'PERMANENT_DEPARTURE',  -- SILENT or ANNOUNCED departures drain first (ADR-004)
     'PRE_WARNING'           -- THRESHOLD_WARNING jobs wait behind the above
 );
@@ -910,8 +978,10 @@ CREATE TABLE repair_jobs (
     trigger_type            repair_trigger_type NOT NULL,
 
     priority                repair_priority     NOT NULL,
-    -- The scheduler dequeues all PERMANENT_DEPARTURE jobs before any PRE_WARNING
-    -- job. Within each priority tier: FIFO on created_at. (ADR-004, Paper 39)
+    
+    -- Dequeue: EMERGENCY first, then PERMANENT_DEPARTURE, then PRE_WARNING. Within each priority tier: FIFO on created_at. (ADR-004) 
+    ORDER BY priority ASC, created_at ASC
+    -- (ENUM ordering: EMERGENCY < PERMANENT_DEPARTURE < PRE_WARNING alphabetically — verify ENUM order)
 
     status                  repair_job_status   NOT NULL DEFAULT 'QUEUED',
 
@@ -933,6 +1003,9 @@ CREATE TABLE repair_jobs (
 
     -- ── Constraints ──────────────────────────────────────────────────────────
     CONSTRAINT repair_jobs_priority_matches_trigger CHECK (
+        (trigger_type = 'EMERGENCY_FLOOR'
+        AND priority = 'EMERGENCY')
+        OR  
         (trigger_type IN ('SILENT_DEPARTURE', 'ANNOUNCED_DEPARTURE')
             AND priority = 'PERMANENT_DEPARTURE')
         OR
@@ -946,6 +1019,12 @@ CREATE TABLE repair_jobs (
         completed_at IS NULL OR started_at IS NOT NULL
     )
     -- A job cannot be completed before it was started.
+
+    CONSTRAINT repair_jobs_no_duplicate_departure
+    UNIQUE (chunk_id, provider_id, trigger_type)
+    -- For threshold-triggered repairs (provider_id IS NULL), deduplication must be
+    -- at the application layer (check for existing QUEUED/IN_PROGRESS job for the
+    -- same chunk_id before inserting).
 );
 
 COMMENT ON TABLE repair_jobs IS
@@ -1007,6 +1086,11 @@ CREATE INDEX idx_files_owner
     ON files (owner_id, uploaded_at DESC)
     WHERE status = 'ACTIVE';
 
+-- Query: find files awaiting deletion confirmation for the GC retry loop (FR-020)
+CREATE INDEX idx_files_pending_deletion
+    ON files (owner_id, uploaded_at)
+    WHERE status = 'DELETION_PENDING';
+
 -- ────────────────────────────────────────────────────────────────────────────
 -- segments
 -- ────────────────────────────────────────────────────────────────────────────
@@ -1034,12 +1118,16 @@ CREATE INDEX idx_chunk_assignments_provider_pending_deletion
     ON chunk_assignments (provider_id)
     WHERE status = 'PENDING_DELETION';
 
--- Query: ASN cap check at assignment time — how many shards does this ASN hold
---        for a given segment?
+-- Query: ASN cap check at assignment time — how many shards does this ASN hold for a given segment?
 -- Joins: chunk_assignments → providers on provider_id (covered by providers.asn index above)
 CREATE INDEX idx_chunk_assignments_segment_provider
     ON chunk_assignments (segment_id, provider_id)
     WHERE status = 'ACTIVE';
+
+
+CREATE UNIQUE INDEX idx_chunk_assignments_one_active_per_shard
+    ON chunk_assignments (segment_id, shard_index)
+    WHERE status IN ('ACTIVE', 'REPAIRING');
 
 -- ────────────────────────────────────────────────────────────────────────────
 -- audit_periods
@@ -1082,6 +1170,10 @@ CREATE INDEX idx_audit_receipts_jit_provider
 CREATE INDEX idx_audit_receipts_provider_file
     ON audit_receipts (provider_id, file_id, server_challenge_ts DESC);
 
+-- Query: FR-058 provider dispute evidence — filter receipts by chunk_id
+CREATE INDEX idx_audit_receipts_provider_chunk
+    ON audit_receipts (provider_id, chunk_id, server_challenge_ts DESC);
+
 -- ────────────────────────────────────────────────────────────────────────────
 -- escrow_events
 -- ────────────────────────────────────────────────────────────────────────────
@@ -1112,6 +1204,11 @@ CREATE INDEX idx_repair_jobs_status_priority
 CREATE INDEX idx_repair_jobs_provider
     ON repair_jobs (provider_id)
     WHERE provider_id IS NOT NULL;
+
+-- Ouery: provider_id is nullable (for threshold triggers)
+CREATE UNIQUE INDEX idx_repair_jobs_threshold_no_dup
+    ON repair_jobs (chunk_id, trigger_type)
+    WHERE provider_id IS NULL AND status IN ('QUEUED', 'IN_PROGRESS');
 ```
 
 ---
@@ -1194,45 +1291,52 @@ suspended when foreground DB read latency at p99 approaches 50 ms (ADR-025).
 -- ── Three-window reliability score per provider ───────────────────────────────
 -- Used by: scoring package, release multiplier computation, assignment service.
 -- Refreshed: after each batch of receipt countersignatures.
+-- CRITICAL: scores_as_of must be within 60 minutes before this view is used
+-- for release multiplier computation (ADR-024). Stale scores produce wrong payments.
+-- The background task scheduler must refresh this view after every receipt batch
+-- and must not defer refresh beyond 60 minutes under background throttling.
 
 CREATE MATERIALIZED VIEW mv_provider_scores AS
 SELECT
     provider_id,
-
-    -- 24-hour window (highest weight: 0.5)
-    SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '24 hours'
-             AND audit_result = 'PASS' THEN 1 ELSE 0 END)::FLOAT
-    /
-    NULLIF(SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '24 hours'
-                    AND audit_result IS NOT NULL THEN 1 ELSE 0 END), 0)
-    AS score_24h,
-
-    -- 7-day window (weight: 0.3)
-    SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '7 days'
-             AND audit_result = 'PASS' THEN 1 ELSE 0 END)::FLOAT
-    /
-    NULLIF(SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '7 days'
-                    AND audit_result IS NOT NULL THEN 1 ELSE 0 END), 0)
-    AS score_7d,
-
-    -- 30-day window (weight: 0.2)
-    SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '30 days'
-             AND audit_result = 'PASS' THEN 1 ELSE 0 END)::FLOAT
-    /
-    NULLIF(SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '30 days'
-                    AND audit_result IS NOT NULL THEN 1 ELSE 0 END), 0)
-    AS score_30d,
-
+    score_24h,
+    score_7d,
+    score_30d,
     -- Weighted composite (ADR-008)
     (
-      COALESCE(score_24h, 0) * 0.5 +
-      COALESCE(score_7d,  0) * 0.3 +
-      COALESCE(score_30d, 0) * 0.2
+        COALESCE(score_24h, 0) * 0.5 +
+        COALESCE(score_7d,  0) * 0.3 +
+        COALESCE(score_30d, 0) * 0.2
     ) AS score_composite
+FROM (
+    SELECT
+        provider_id,
 
-FROM audit_receipts
-WHERE abandoned_at IS NULL
-GROUP BY provider_id;
+        -- 24-hour window (highest weight: 0.5)
+        SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '24 hours'
+                 AND audit_result = 'PASS' THEN 1 ELSE 0 END)::FLOAT
+        / NULLIF(SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '24 hours'
+                          AND audit_result IS NOT NULL THEN 1 ELSE 0 END), 0)
+        AS score_24h,
+        
+        -- 7-day window (weight: 0.3)
+        SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '7 days'
+                 AND audit_result = 'PASS' THEN 1 ELSE 0 END)::FLOAT
+        / NULLIF(SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '7 days'
+                          AND audit_result IS NOT NULL THEN 1 ELSE 0 END), 0)
+        AS score_7d,
+
+        -- 30-day window (weight: 0.2)
+        SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '30 days'
+                 AND audit_result = 'PASS' THEN 1 ELSE 0 END)::FLOAT
+        / NULLIF(SUM(CASE WHEN server_challenge_ts >= NOW() - INTERVAL '30 days'
+                          AND audit_result IS NOT NULL THEN 1 ELSE 0 END), 0)
+        AS score_30d
+
+    FROM audit_receipts
+    WHERE abandoned_at IS NULL
+    GROUP BY provider_id
+) sub;
 
 CREATE UNIQUE INDEX ON mv_provider_scores (provider_id);
 -- Required for concurrent refresh without locking.
@@ -1243,20 +1347,34 @@ CREATE UNIQUE INDEX ON mv_provider_scores (provider_id);
 -- Refreshed: after each DEPOSIT, RELEASE, or SEIZURE event.
 -- Update: WE MADE AN AMMEND ADDING 'REVERSAL', 
 -- Please make these changes: the balance formula becomes: SUM(DEPOSIT + REVERSAL) - SUM(RELEASE + SEIZURE). The idempotency key for a REVERSAL event is SHA-256("reversal" || original_idempotency_key), which is deterministic given the original payout's key.
+-- COMMENT: idempotency_key for REVERSAL = SHA-256('reversal' || original_idempotency_key)
+-- This must be enforced at the application layer — no DB constraint can derive it.
 
 CREATE MATERIALIZED VIEW mv_provider_escrow_balance AS
 SELECT
     provider_id,
-    SUM(CASE WHEN event_type = 'DEPOSIT'
-             THEN amount_paise ELSE 0 END)
+    SUM(CASE WHEN event_type IN ('DEPOSIT', 'REVERSAL') THEN amount_paise ELSE 0 END)
     -
-    SUM(CASE WHEN event_type IN ('RELEASE', 'SEIZURE')
-             THEN amount_paise ELSE 0 END)
+    SUM(CASE WHEN event_type IN ('RELEASE', 'SEIZURE') THEN amount_paise ELSE 0 END)
     AS balance_paise
 FROM escrow_events
 GROUP BY provider_id;
 
 CREATE UNIQUE INDEX ON mv_provider_escrow_balance (provider_id);
+
+
+-- ── Escrow balance per owner ────────────────────────────────────────────────
+CREATE MATERIALIZED VIEW mv_owner_escrow_balance AS
+SELECT
+    owner_id,
+    SUM(CASE WHEN event_type IN ('DEPOSIT', 'REFUND') THEN amount_paise ELSE 0 END)
+    -
+    SUM(CASE WHEN event_type IN ('CHARGE', 'WITHDRAWAL') THEN amount_paise ELSE 0 END)
+    AS balance_paise
+FROM owner_escrow_events
+GROUP BY owner_id;
+
+CREATE UNIQUE INDEX ON mv_owner_escrow_balance (owner_id);
 
 
 -- ── Available shard count per segment ─────────────────────────────────────────
@@ -1334,7 +1452,19 @@ never drift apart.
 
 ---
 
-### 8.6 `chunk_assignments.deleted_at`
+### 8.6 `providers.first_chunk_assignment_at`
+
+**Null means:** no chunk has been assigned yet (PENDING_ONBOARDING or early VETTING). Set on first chunk assignment by the assignment service.
+
+---
+
+### 8.7 `files.display_name_*`
+
+**Null means:** the three display_name_* columns are NULL when the owner uploads without a label (CLI path, bulk upload).
+
+---
+
+### 8.8 `chunk_assignments.deleted_at`
 
 **Null means:** The chunk assignment is not deleted. For `status != 'DELETED'` rows,
 this is always NULL. It records the wall-clock time of deletion for audit purposes
@@ -1342,7 +1472,7 @@ and for the operator repair timeline view.
 
 ---
 
-### 8.7 `audit_receipts.response_hash`
+### 8.9 `audit_receipts.response_hash`
 
 **Null means:** Either the row is in the `PENDING` in-flight state (no response
 received yet) OR the `audit_result` is `TIMEOUT` (no response ever arrived).
@@ -1352,14 +1482,14 @@ The `CHECK` constraint enforces this pairing.
 
 ---
 
-### 8.8 `audit_receipts.response_latency_ms`
+### 8.10 `audit_receipts.response_latency_ms`
 
 **Null means:** Same as `response_hash` — either PENDING or TIMEOUT. There is no
 latency to record if no response arrived.
 
 ---
 
-### 8.9 `audit_receipts.audit_result`
+### 8.11 `audit_receipts.audit_result`
 
 **Null means:** The row is in the `PENDING` in-flight state. Phase 1 of the
 two-phase write (durable INSERT before validation) has completed; Phase 2 (setting
@@ -1371,7 +1501,7 @@ status column for the two-phase write to be unambiguous.
 
 ---
 
-### 8.10 `audit_receipts.provider_sig`
+### 8.12 `audit_receipts.provider_sig`
 
 **Null means:** Either PENDING (provider has not responded) or TIMEOUT (provider
 never responded). There is no provider signature to verify if there is no response.
@@ -1380,7 +1510,7 @@ The `CHECK` constraint ensures that `audit_result IN ('PASS', 'FAIL')` implies
 
 ---
 
-### 8.11 `audit_receipts.service_sig`
+### 8.13 `audit_receipts.service_sig`
 
 **Null means:** Phase 2 of the two-phase write has not yet executed. The
 microservice's countersignature is set in the same UPDATE as `audit_result` and
@@ -1392,7 +1522,7 @@ For TIMEOUT, `provider_sig` is NULL but `service_sig` is NOT NULL after Phase 2.
 
 ---
 
-### 8.12 `audit_receipts.service_countersign_ts`
+### 8.14 `audit_receipts.service_countersign_ts`
 
 **Null means:** Phase 2 has not executed. Always NULL/non-NULL in lockstep with
 `service_sig`. The constraint `(service_sig IS NULL) = (service_countersign_ts IS NULL)`
@@ -1400,7 +1530,7 @@ enforces this.
 
 ---
 
-### 8.13 `audit_receipts.abandoned_at`
+### 8.15 `audit_receipts.abandoned_at`
 
 **Null means:** The row is not abandoned. For all active (non-GC'd) rows, this is
 NULL. When the GC process marks a stale PENDING row as abandoned, it sets this
@@ -1410,7 +1540,7 @@ marks rows; it does not delete them.
 
 ---
 
-### 8.14 `escrow_events.audit_period_id`
+### 8.16 `escrow_events.audit_period_id`
 
 **Null means:** The event is a DEPOSIT (triggered by a data owner UPI payment — not
 associated with any audit period) or a SEIZURE (the entire rolling balance is seized
@@ -1420,7 +1550,7 @@ pays out, enabling the operator to audit which period was paid.
 
 ---
 
-### 8.15 `repair_jobs.provider_id`
+### 8.17 `repair_jobs.provider_id`
 
 **Null means:** The repair was triggered by the redundancy threshold crossing below
 r0 = 24, with no single provider departure as the proximate cause. This happens
@@ -1431,14 +1561,14 @@ record for seizure correlation and telemetry.
 
 ---
 
-### 8.16 `repair_jobs.started_at`
+### 8.18 `repair_jobs.started_at`
 
 **Null means:** The job is still in `QUEUED` status. No repair worker has picked it
 up yet.
 
 ---
 
-### 8.17 `repair_jobs.completed_at`
+### 8.19 `repair_jobs.completed_at`
 
 **Null means:** The job is `QUEUED` or `IN_PROGRESS`. Set when status becomes
 `COMPLETED` or `FAILED`. The constraint `completed_at IS NULL OR started_at IS NOT NULL`
@@ -1465,6 +1595,20 @@ Before applying `migrations/001_initial_schema.sql` to any environment, verify:
   50 GB each, the table accumulates ~1.8 TB/year. Partitioning by month (`PARTITION BY RANGE (server_challenge_ts)`) and archiving partitions older than 30 days to cold object storage is mandatory from day one. See `capacity.md §4.3`.
 - [ ] Materialised views are created after all base tables.
 - [ ] Unique indexes on materialised views are present (required for `REFRESH MATERIALIZED VIEW CONCURRENTLY`).
+- [ ] Add to mv_provider_scores:
+NOW() AS scores_as_of   -- consumers must check age before using for payment decisions
+- [ ] Partial unique index on chunk_assignments created after table — not an inline constraint.
+- [ ] CREATE EXTENSION IF NOT EXISTS btree_gist; (before audit_periods)
+- [ ] chunk_assignments partial unique index created as a standalone CREATE UNIQUE INDEX,
+      NOT as an inline table constraint (inline WHERE on UNIQUE is invalid syntax)
+- [ ] repair_priority ENUM has three values: EMERGENCY, PERMANENT_DEPARTURE, PRE_WARNING
+- [ ] file_status ENUM has three values: ACTIVE, DELETION_PENDING, DELETED
+- [ ] mv_provider_scores uses a subquery — column aliases not referenced in same SELECT level
+- [ ] mv_provider_escrow_balance includes REVERSAL in the DEPOSIT-side SUM
+- [ ] owner_escrow_events table created (required for FR-014, FR-021, FR-059)
+- [ ] providers.first_chunk_assignment_at column present (required for FR-026 120-day check)
+- [ ] files.display_name_ciphertext/nonce/tag columns present (required for FR-019)
+- [ ] p95_throughput_kbps and avg_rtt_ms default to NULL, not 0/2000
 
 ---
 

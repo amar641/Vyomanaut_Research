@@ -29,9 +29,8 @@ When a provider is declared "Permanently silent departed" (absence > 72h):
 
 1. The microservice sets `providers.status = DEPARTED` (soft delete — physical row removal is
    prohibited per [ADR-013](./ADR-013-consistency-model.md) consistency model).
-2. All of the provider's chunk assignments are hard-removed from the `chunk_assignments` table.
-   The chunks are already in the repair queue; the assignments exist only as a routing record
-   for challenge dispatch. Removing them stops all further challenge issuance to this provider.
+2. All of the provider's chunk assignments are soft-deleted from the `chunk_assignments` table.
+   The chunks are already in the repair queue; the status column in chunk_assignments table is set to `DELETED`.
 3. The provider's escrow is seized ([ADR-024](./ADR-024-economic-mechanism.md)).
 4. The provider's Peer ID is removed from the DHT routing tables on the next republication
    cycle ([ADR-001](./ADR-001-coordination-architecture.md): availability service manages DHT records).
@@ -50,8 +49,8 @@ If the provider comes back online after step 2:
 
 This is the correct design: the departed provider's chunk has already been replaced by repair.
 Two providers holding the same shard is not a durability problem (more replicas is fine) but
-it is a payment problem. Hard-removing assignments on departure ensures the payment system
-never issues credits for untracked storage.
+it is a payment problem. Hard-removing assignments on departure would have ensured that the payment system
+never issues credits for untracked storage. But we use a safer soft delete with a flag `status=DELETED`
 
 The vetting period begins from scratch on rejoin. No prior score history is carried over.
 

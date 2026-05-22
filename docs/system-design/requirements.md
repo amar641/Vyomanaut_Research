@@ -135,7 +135,7 @@ first quarter post-launch). Every P0 requirement is a launch blocker.
 | FR-023 | At first launch, the daemon must generate an Ed25519 key pair, persist it encrypted under a daemon-local passphrase, and display the public key fingerprint to the provider for their records. | P0 | ADR-021; peer identity |
 | FR-024 | The daemon must register with the microservice by submitting the provider's phone number (OTP-verified), Ed25519 public key, declared storage allocation in GB, and declared city/region. | P0 | ADR-001, ADR-005 |
 | FR-025 | The system must initiate Razorpay Route Linked Account creation asynchronously after registration and must not begin chunk assignment until the 24-hour cooling period has elapsed and the account is confirmed active. | P0 | ADR-024, Paper 35 |
-| FR-026 | The daemon must set `providers.status = PENDING_ONBOARDING` at registration, advance to `VETTING` on first successful heartbeat, and advance to `ACTIVE` automatically once both conditions are satisfied: (a) a minimum of 120 days have elapsed since first chunk assignment, AND (b) 80 audit passes have been recorded (not necessarily consecutive) without any DEPARTED or SILENT_DEPARTURE event in between. | P0 | ADR-005, ADR-007 |
+| FR-026 | The daemon must set `providers.status = PENDING_ONBOARDING` at registration, advance to `VETTING` on first successful heartbeat, and advance to `ACTIVE` automatically once both conditions are satisfied: (a) a minimum of 120 days have elapsed since first chunk assignment, AND (b) 80 consecutive audit passes have been recorded without any DEPARTED or SILENT_DEPARTURE event in between. | P0 | ADR-005, ADR-007 |
 
 ### 4.6 Provider — Operation
 
