@@ -495,6 +495,8 @@ The provider receives the challenge and:
 
 The microservice verifies the provider's Ed25519 signature over the receipt fields, then writes one row to `audit_receipts`. The table is INSERT-only — no row is ever updated or deleted, enforced by Postgres row security policy. But (audit_result, service_sig, service_countersign_ts) fields are treated as an exeption. Both the provider and microservice sign the receipt with Ed25519. ([ADR-017](../decisions/ADR-017-audit-receipt-schema.md), [ADR-015](../decisions/ADR-015-audit-trail.md))
 
+>**NOTE:** The correctness of response_hash — that it was computed over the actual 256 KB chunk and not fabricated — is guaranteed by the computational hardness of SHA-256 preimage inversion, not by independent microservice verification. Please note the microservice never verifies the response_hash, it knows the chunk_id but not the 256 KB chunk data making the SHA-256(chunk_data || challenge_nonce) unverifiable. It only verifies the Ed25519 signature.
+
 ### The Audit receipt schema
 
 | Field | Purpose |

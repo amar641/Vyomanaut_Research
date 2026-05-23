@@ -614,8 +614,7 @@ COMMENT ON TABLE chunk_assignments IS
     '20% ASN cap enforced at INSERT time by the assignment service (ADR-014). '
     'On provider SILENT/ANNOUNCED departure: status → DELETED, challenge issuance stops.'
     'Physical deletion is NOT performed — historical assignment data is preserved for '
-    'audit reconciliation. ADR-007 language ("hard-removed") refers to the effect on '
-    'challenge routing, not physical row deletion. '
+    'audit reconciliation.'
     'On file owner deletion: status → PENDING_DELETION → DELETED after provider GC confirms.';
 COMMENT ON COLUMN chunk_assignments.chunk_id IS
     'SHA-256(shard_data). RocksDB lookup key on the provider daemon (ADR-023). '
@@ -1278,6 +1277,8 @@ CREATE POLICY escrow_events_insert_only
 -- No UPDATE or DELETE policy. Any attempt returns permission denied.
 ```
 
+>**NOTE:** An additional security policy is enabled for the [chunk_assingments table](#45-chunk_assignments), previously due to verbatim errors a HARD-DELETE was issued for an entry when the provider had a SILENT/ANNOUNCED departure. But now a soft delete policy is implemented where only the status is changed to be DELETED
+
 ---
 
 ## 7. Materialised Views
@@ -1609,6 +1610,7 @@ NOW() AS scores_as_of   -- consumers must check age before using for payment dec
 - [ ] providers.first_chunk_assignment_at column present (required for FR-026 120-day check)
 - [ ] files.display_name_ciphertext/nonce/tag columns present (required for FR-019)
 - [ ] p95_throughput_kbps and avg_rtt_ms default to NULL, not 0/2000
+- [ ] Add REVERSAL to escrow_event_type ENUM.
 
 ---
 
