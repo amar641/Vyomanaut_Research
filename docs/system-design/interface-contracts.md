@@ -32,6 +32,7 @@ Where this document conflicts with an ADR, the ADR wins. Where it conflicts with
    - [4.2 Audit Challenge Protocol](#42-audit-challenge-protocol) 
    - [4.3 Circuit Relay v2 Reservation](#43-circuit-relay-v2-reservation)
    - [4.4 Repair Reconstruction Stream Protocol](#44-repair-reconstruction-stream-protocol)
+   - [4.5 Vetting GC Protocol](#45-vetting-gc-protocol)
 5. [Internal Go Package Contracts](#5-internal-go-package-contracts)
    - [5.1 `internal/crypto`](#51-internalcrypto)
    - [5.2 `internal/erasure`](#52-internalerasure)
@@ -42,6 +43,7 @@ Where this document conflicts with an ADR, the ADR wins. Where it conflicts with
    - [5.7 `internal/repair`](#57-internalrepair)
    - [5.8 `internal/payment`](#58-internalpayment)
    - [5.9 `internal/client`](#59-internalclient)
+   - [5.10 `internal/vettingchunk`](#510-internalvettingchunk)
 6. [PostgreSQL Row-Level Contracts](#6-postgresql-row-level-contracts)
 7. [Razorpay Webhook Contracts](#7-razorpay-webhook-contracts)
    - [7.1 `virtual_account.payment.captured`](#71-virtual_accountpaymentcaptured)
@@ -605,6 +607,59 @@ REPAIRING back to ACTIVE for the new provider's row.
 
 ---
 
+### 4.5 Vetting GC Protocol
+
+On the ACTIVE transition for a provider previously in VETTING status, the microservice delivers a GC instruction listing all synthetic chunk IDs that the provider must delete from its vLog. This instruction is delivered via a dedicated libp2p stream rather than the REST heartbeat path because the chunk list can be large (up to `declared_storage_gb × 400`entries) and because the provider's HTTP session may not be active at transition time.
+
+**Protocol ID:** `/vyomanaut/vetting-gc/1.0.0`
+
+**Participants:** Initiator = coordination microservice; Responder = provider daemon.
+
+**0-RTT policy:** **Prohibited.** A GC instruction causes the daemon to permanently delete data from its vLog via `DeleteChunk`. Replaying a GC instruction is idempotent at the `DeleteChunk` layer (deleting an already-deleted entry is a no-op), but the prohibition is maintained as a defensive policy because the instruction stream carries operational consequence. Set `DisableEarlyData: true` on the TLS configuration for this protocol.
+
+**When the stream is initiated:**
+
+1. Immediately after `providers.status` is set to `'ACTIVE'` in the database.
+2. If the provider is offline, the microservice retries on the provider's next successful heartbeat connection (`POST /api/v1/provider/heartbeat` returns HTTP 200).
+3. Retries use exponential backoff: 5 min → 15 min → 60 min → next heartbeat.
+
+**Frame 1 — VettingGCRequest:**
+
+| Field | Type | Size | Description |
+| --- | --- | --- | --- |
+| `length` | uint32 big-endian | 4 B | Payload length. `4 + (chunk_count × 32)` bytes. |
+| `chunk_count` | uint32 big-endian | 4 B | Number of chunk IDs in this batch. Maximum 10,000 per frame. |
+| `chunk_ids` | bytes[] | `chunk_count × 32 B` | Array of 32-byte chunk IDs (SHA-256 content addresses) to delete. These are all synthetic vetting chunk IDs where `is_vetting_chunk = TRUE AND provider_id = $1 AND status = 'ACTIVE'` at the time of the ACTIVE transition. |
+
+If the provider holds more than 10,000 synthetic chunks, the microservice sends multiple sequential frames on the same stream (each a complete `VettingGCRequest`), waiting for `VettingGCResponse` after each before sending the next.
+
+Maximum single frame payload: `4 + (10000 × 32) = 320,004 bytes`.
+
+**Frame 2 — VettingGCResponse:**
+
+| Field | Type | Size | Description |
+| --- | --- | --- | --- |
+| `length` | uint32 big-endian | 4 B | Payload length: `1 + ceil(chunk_count / 8)` bytes. |
+| `status` | uint8 | 1 B | `0x00` = all deletions succeeded. `0x01` = partial failure (see `failure_bitmap`). `0x02` = INTERNAL_ERROR (vLog or RocksDB failure; microservice must retry the full batch). |
+| `failure_bitmap` | bytes | `ceil(chunk_count / 8) B` | Present only when `status = 0x01`. Bit N is set if deletion of `chunk_ids[N]` failed. The microservice must retry failed entries on the next connection. Absent when `status = 0x00`. |
+
+**Timeout:** The microservice must receive `VettingGCResponse` within 30,000 ms per frame. A longer timeout than the audit challenge (which processes one 256 KB read) is warranted because the daemon may be deleting thousands of RocksDB entries.
+
+**Post-conditions on `status = 0x00` for a batch:**
+
+- `DeleteChunk` has been called for each chunk ID in the batch on the daemon side.
+- Each successfully deleted chunk ID should have its `chunk_assignments.status` set to `'DELETED'` by the microservice after receiving `status = 0x00`.
+
+**Failure handling:**
+
+- `status = 0x01`: Microservice retries only the failed chunk IDs on next connection. Successfully deleted chunks in the same batch are marked `'DELETED'` immediately.
+- `status = 0x02`: Full batch retry on next connection. No `chunk_assignments` rows are marked `'DELETED'` — they remain `'PENDING_DELETION'` until the batch succeeds.
+- Provider offline at transition time: all synthetic chunk rows set to `'PENDING_DELETION'`; stream initiated on next heartbeat. The audit scheduler must not issue challenges for `'PENDING_DELETION'` rows.
+
+**Concurrency:** Only one vetting GC stream may be active per provider at a time. If a second ACTIVE transition is somehow triggered (e.g. after a re-registration), the microservice must complete the first GC stream before initiating another.
+
+---
+
 ## 5. Internal Go Package Contracts
 
 This section specifies the exported interface of every internal package, including:
@@ -923,6 +978,12 @@ type ChunkStore interface {
     //   - The RocksDB index entry for chunkID is deleted
     //   - Subsequent LookupChunk calls for this chunkID will return ErrChunkNotFound
     //   - The vLog entry remains on disk until GC reclaims it
+    // VETTING GC PATH: This function is also called by the vetting GC handler
+    // (§4.5) to delete synthetic vetting chunks on the ACTIVE provider transition.
+    // For synthetic chunks, the call semantics are identical: the chunk ID is removed
+    // from RocksDB, subsequent LookupChunk calls return ErrChunkNotFound, and the
+    // vLog space is reclaimed during the next GC cycle. The daemon has no visibility
+    // into whether the deleted chunk was synthetic or real. (ADR-030)
     // Goroutine-safe: yes.
     DeleteChunk(chunkID [32]byte) error
 
@@ -1234,17 +1295,16 @@ const (
 )
 
 // EnqueueJob inserts a repair job into the repair_jobs table.
-// The priority is derived from triggerType automatically (enforcing the
-// repair_jobs_priority_matches_trigger constraint in data-model.md).
+// The priority is derived from triggerType automatically (enforcing the repair_jobs_priority_matches_trigger constraint in data-model.md).
 //
 // Pre-conditions:
 //   - len(chunkID) == 32
 //   - segmentID is a valid UUID
-//   - availableShardCount is in [16, 56]
+//   - availableShardCount is in [16, 56] 
+//   - The chunk_assignments row for (chunkID, any active provider) must have is_vetting_chunk = FALSE. Calling EnqueueJob for a synthetic vetting chunk (is_vetting_chunk = TRUE) is a calling contract violation that panics in debug builds. The departure handler must check is_vetting_chunk before calling EnqueueJob. (ADR-030, Invariant 6)
 // Post-conditions (on nil error):
 //   - A row with status='QUEUED' is inserted into repair_jobs
-//   - priority is set to PERMANENT_DEPARTURE iff triggerType is SilentDeparture
-//     or AnnouncedDeparture; PRE_WARNING otherwise
+//   - priority is set to PERMANENT_DEPARTURE iff triggerType is SilentDeparture or AnnouncedDeparture; PRE_WARNING otherwise
 // Error semantics: database errors returned; nil means success.
 // Goroutine-safe: yes.
 func EnqueueJob(ctx context.Context, db *sql.DB,
@@ -1257,6 +1317,39 @@ func EnqueueJob(ctx context.Context, db *sql.DB,
 //
 // Goroutine-safe: yes (uses SELECT ... FOR UPDATE SKIP LOCKED).
 func DequeueNextJob(ctx context.Context, db *sql.DB) (*RepairJob, error)
+
+// IsVettingChunk returns true if the given chunkID is a synthetic vetting chunk.
+// Must be called by the departure handler and threshold monitor before invoking
+// EnqueueJob. If true, no repair job should be enqueued. (ADR-030)
+//
+// Pre-conditions:
+//   - len(chunkID) == 32
+//   - providerID is the provider suspected of departure (used to disambiguate
+//     if the same chunk_id somehow exists on multiple providers, synthetic and real)
+// Post-conditions (on nil error):
+//   - returns true iff a chunk_assignments row exists with the given (chunkID, providerID)
+//     and is_vetting_chunk = TRUE
+// Goroutine-safe: yes.
+func IsVettingChunk(ctx context.Context, db *sql.DB,
+    chunkID [32]byte, providerID uuid.UUID) (bool, error)
+
+// DeleteVettingChunksOnDeparture soft-deletes all synthetic chunk assignments for a
+// departing vetting provider. Must be called by the departure handler when
+// providers.status is being set to 'DEPARTED' for a provider that was in VETTING status.
+// Does not enqueue any repair jobs. (ADR-030, FR-065)
+//
+// Pre-conditions:
+//   - providerID identifies a provider with status transitioning to 'DEPARTED'
+//   - All chunk_assignments for this provider must have is_vetting_chunk = TRUE
+//     (departure handler verifies no real shard assignments exist)
+// Post-conditions (on nil error):
+//   - All chunk_assignments rows for providerID with is_vetting_chunk = TRUE
+//     are set to status = 'DELETED', deleted_at = NOW()
+//   - Zero repair_jobs rows are created
+// Error semantics: database errors returned; nil means success.
+// Goroutine-safe: yes.
+func DeleteVettingChunksOnDeparture(ctx context.Context, db *sql.DB,
+    providerID uuid.UUID) error
 
 // MarkJobComplete sets a repair job's status to COMPLETED or FAILED.
 //
@@ -1449,6 +1542,76 @@ var (
 
 ---
 
+### 5.10 `internal/vettingchunk`
+
+```go
+// Package vettingchunk manages the synthetic chunk lifecycle: generation, assignment,
+// GC instruction delivery, and departure cleanup. (ADR-030)
+package vettingchunk
+
+// Generator produces synthetic vetting chunks for assignment to VETTING providers.
+type Generator interface {
+    // GenerateChunk creates a single 256 KB random block and returns its chunk ID.
+    // The generated data is immediately uploaded to the provider via the standard
+    // chunk upload stream (/vyomanaut/chunk-upload/1.0.0).
+    //
+    // Pre-conditions:
+    //   - providerID identifies a provider with status = 'VETTING'
+    //   - The provider's current synthetic chunk count < floor(declared_storage_gb × 400)
+    //     (cap enforcement is the caller's responsibility before invoking GenerateChunk)
+    // Post-conditions (on nil error):
+    //   - 256 KB of crypto/rand data is generated, uploaded, and acknowledged by the provider
+    //   - A chunk_assignments row is inserted with is_vetting_chunk = TRUE,
+    //     segment_id = NULL, shard_index = NULL
+    //   - The chunkID (SHA-256 of the generated data) is returned for record-keeping
+    //
+    // Note: The raw 256 KB data is NOT retained by the microservice after upload confirmation.
+    // The chunkID alone is sufficient to issue future audit challenges.
+    //
+    // Goroutine-safe: yes.
+    GenerateChunk(ctx context.Context,
+        providerID uuid.UUID) (chunkID [32]byte, err error)
+
+    // CurrentCount returns the number of ACTIVE synthetic chunks for a provider.
+    // Used by the assignment service for cap enforcement.
+    //
+    // Goroutine-safe: yes.
+    CurrentCount(ctx context.Context, db *sql.DB, providerID uuid.UUID) (int, error)
+
+    // Cap returns the maximum allowed synthetic chunks for a provider.
+    // cap = floor(declared_storage_gb × 400)
+    // This is a pure function of declared_storage_gb; no database read required.
+    Cap(declaredStorageGB int) int
+}
+
+// GCDelivery manages the delivery of vetting GC instructions on ACTIVE transition.
+type GCDelivery interface {
+    // DeliverGCInstruction sends the vetting GC instruction list to the provider daemon
+    // via the /vyomanaut/vetting-gc/1.0.0 libp2p protocol. If the provider is offline,
+    // marks all synthetic chunk_assignments as 'PENDING_DELETION' and queues retry.
+    //
+    // Pre-conditions:
+    //   - providerID has just transitioned to status = 'ACTIVE'
+    //   - providerID had status = 'VETTING' immediately before the transition
+    // Post-conditions (on nil error):
+    //   - All synthetic chunk_assignments for providerID are marked 'DELETED'
+    //   - The provider's vLog no longer contains any synthetic chunk data
+    // Error semantics:
+    //   - ErrProviderOffline: provider not reachable; rows set to 'PENDING_DELETION';
+    //     caller must retry on next heartbeat connection
+    // Goroutine-safe: yes.
+    DeliverGCInstruction(ctx context.Context, providerID uuid.UUID) error
+}
+
+var (
+    ErrProviderOffline   = errors.New("vettingchunk: provider not reachable for GC delivery")
+    ErrCapExceeded       = errors.New("vettingchunk: synthetic chunk cap exceeded for provider")
+    ErrNotVettingProvider = errors.New("vettingchunk: provider is not in VETTING status")
+)
+```
+
+---
+
 ## 6. PostgreSQL Row-Level Contracts
 
 This section specifies exactly what DML each application role may perform on each table.
@@ -1505,9 +1668,14 @@ the database layer; the contracts here document the intent for application-layer
 |---|---|---|
 | INSERT `segments` | `vyomanaut_app` | During upload assignment only |
 | INSERT `chunk_assignments` | `vyomanaut_app` | During upload assignment and repair replacement only; ASN cap enforced at INSERT time |
+| INSERT `is_vetting_chunk = TRUE` | `vyomanaut_app` | Only when the target provider's `status = 'VETTING'`. The assignment service must verify provider status before INSERT. |
+| INSERT `is_vetting_chunk = FALSE` | `vyomanaut_app` | Only when the target provider's `status = 'ACTIVE'`. Inserting real shards to a VETTING provider is a calling contract violation (Invariant 6). |
 | UPDATE `chunk_assignments.status` | `vyomanaut_app` | Permitted transitions only: `ACTIVE → REPAIRING`, `ACTIVE → PENDING_DELETION`, `REPAIRING → ACTIVE`, `PENDING_DELETION → DELETED` |
 | UPDATE `chunk_assignments` status to 'DELETED', set deleted_at = NOW() | `vyomanaut_app` | Departure handler only, when `providers.status = 'DEPARTED'`. This is a soft-delete. The row is never physically removed. The `active_chunk_assignments` view excludes these rows from challenge scheduling automatically. Physical `DELETE` is prohibited for all roles — it breaks the audit receipt trail. |
+| UPDATE `status` to `'PENDING_DELETION'` for synthetic chunks | `vyomanaut_app` | On ACTIVE transition (before GC delivery) or when provider goes offline after `ACTIVE` transition. The audit scheduler must stop issuing challenges for `PENDING_DELETION` rows. |
+| UPDATE `status` to `'DELETED'` for synthetic chunks | `vyomanaut_app` | After successful GC confirmation from the daemon via the vetting GC protocol (§4.5). |
 | DELETE `segments` | **Prohibited** | Segments are immutable references |
+| Repair job creation for `is_vetting_chunk = TRUE` rows | Prohibited for all roles | Any code path that calls `repair.EnqueueJob` for a synthetic chunk is a bug. Invariant 6. `IsVettingChunk()` must be called before any EnqueueJob invocation in the departure handler and threshold monitor. |
 
 ### `audit_receipts`
 
@@ -1852,6 +2020,7 @@ coordination across the affected components before deployment**.
   multistream-select and handle both the old and new protocol for the overlap period.
 - **Never change the framing without a version bump.** Changing the `length` field encoding
   or a message field's byte offset is always a breaking change.
+- `/vyomanaut/vetting-gc/1.0.0` — initial version. The GC instruction frame format (VettingGCRequest / VettingGCResponse) must increment the version string if any of the following change: the `chunk_count` field encoding, the batch size limit, the failure bitmap format, or the response status byte semantics. The protocol must remain in the daemon binary indefinitely: an `ACTIVE provider` that received GC instructions years earlier may need to re-run GC after a crash (the `PENDING_DELETION` rows will retrigger delivery on reconnect). Removing the protocol handler from the daemon requires a coordinated network-wide migration.
 
 ### Internal Go Package Interfaces
 
